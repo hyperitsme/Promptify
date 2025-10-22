@@ -1,4 +1,4 @@
-// src/util.js — robust fence stripper
+// src/util.js — fence stripper yang toleran
 export async function toDataURL(file) {
   if (!file) return undefined;
   const base64 = file.buffer.toString('base64');
@@ -8,10 +8,7 @@ export async function toDataURL(file) {
 
 export function sanitizeHTMLFromModel(text) {
   if (!text) return '';
-  // Ambil isi di dalam fence ```html ... ``` ATAU ``` ... ```
-  // Toleran terhadap \n / \r\n dan spasi
   const fence = text.match(/```(?:html)?\s*([\s\S]*?)\s*```/i);
   const raw = fence ? fence[1] : text;
-  // Jika model menambahkan markdown lain, jangan di-strip berlebihan—cukup trim.
   return String(raw).trim();
 }
