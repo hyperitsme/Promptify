@@ -1,3 +1,4 @@
+// src/server.js — FINAL anti-blank wrapper + robust output + proxy fix
 import 'dotenv/config';
 import express from 'express';
 import helmet from 'helmet';
@@ -12,9 +13,10 @@ import { toDataURL, sanitizeHTMLFromModel } from './util.js';
 const app = express();
 const port = process.env.PORT || 8080;
 
+// Penting di Render agar rate-limit dan IP benar
 app.set('trust proxy', 1);
 
-// CORS
+// --- CORS allowlist ---
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
   .map(s => s.trim())
@@ -33,7 +35,7 @@ app.use(
   })
 );
 
-// Rate limit
+// --- Rate limit ---
 const limiter = rateLimit({
   windowMs: 60 * 1000,
   limit: 30,
@@ -42,10 +44,10 @@ const limiter = rateLimit({
 });
 app.use('/api/', limiter);
 
-// Uploads
+// --- Uploads (logo/bg) ---
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 2 * 1024 * 1024, files: 2 },
+  limits: { fileSize: 2 * 1024 * 1024, files: 2 }, // 2MB
 });
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -54,6 +56,7 @@ app.get('/api/health', (_, res) =>
   res.json({ ok: true, service: 'promptify-backend', time: new Date().toISOString() })
 );
 
+// --- Input schema ---
 const GenSchema = z.object({
   name: z.string().min(1).max(60),
   ticker: z.string().min(1).max(16),
@@ -67,7 +70,7 @@ const GenSchema = z.object({
   }),
 });
 
-// Fallback bila AI kosong → tidak pernah blank
+// ---- Helper: fallback HTML (kalau AI kosong) ----
 function fallbackHTML({ name, ticker, prompt, colors, logoDataURL, bgDataURL, xurl, tgurl }) {
   const cssBg = bgDataURL ? `background-image:url('${bgDataURL}');background-size:cover;background-position:center;` : '';
   const logo = logoDataURL ? `<img src="${logoDataURL}" alt="${name} logo" style="width:56px;height:56px;border-radius:12px;box-shadow:0 8px 40px rgba(0,0,0,.35)" />` : '';
@@ -115,6 +118,35 @@ a.link{color:var(--ink)}
 </body></html>`;
 }
 
+// ---- Helper: bungkus apapun HTML AI ke penampil agar tidak blank ----
+function wrapAIHTML({ name, ticker, colors, aiHTML }) {
+  // pakai data URL agar aman dari escaping kompleks
+  const base64 = Buffer.from(aiHTML || '', 'utf8').toString('base64');
+  const dataURL = `data:text/html;base64,${base64}`;
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>${name} — ${ticker} (Preview)</title>
+<style>
+:root{--primary:${colors.primary};--accent:${colors.accent};--bg:${colors.bg};--ink:#e9ecff}
+*{box-sizing:border-box}html,body{height:100%}
+body{margin:0;background:radial-gradient(800px 500px at 80% -10%,rgba(109,97,255,.25),transparent 60%),linear-gradient(180deg,var(--bg),#0b0e1d);color:var(--ink);font-family:ui-sans-serif,system-ui,Inter,Segoe UI,Roboto,Arial}
+.top{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 14px;border-bottom:1px solid rgba(255,255,255,.08);background:rgba(7,8,17,.55);backdrop-filter:blur(8px)}
+.badge{background:linear-gradient(135deg,var(--primary),var(--accent));padding:6px 10px;border-radius:999px;font-weight:700;box-shadow:0 10px 34px rgba(104,88,255,.35)}
+.wrap{padding:10px}
+.viewer{width:100%;height:calc(100vh - 56px);border:1px solid rgba(255,255,255,.08);border-radius:12px;background:#0b0e1d}
+</style></head>
+<body>
+  <div class="top">
+    <div><span class="badge">${ticker}</span> <strong style="margin-left:8px">${name}</strong></div>
+    <div style="opacity:.85">AI Preview</div>
+  </div>
+  <div class="wrap">
+    <iframe class="viewer" sandbox="allow-same-origin allow-scripts" src="${dataURL}"></iframe>
+  </div>
+</body></html>`;
+}
+
+// ---- Generate endpoint ----
 app.post(
   '/api/generate',
   upload.fields([{ name: 'logo', maxCount: 1 }, { name: 'bg', maxCount: 1 }]),
@@ -128,8 +160,8 @@ app.post(
         tgurl: req.body.tgurl,
         colors: {
           primary: req.body['colors[primary]'] || req.body.primary || '#4d6bff',
-          accent: req.body['colors[accent]'] || req.body.accent || '#8a5cff',
-          bg: req.body['colors[bg]'] || req.body.bg || '#070811',
+          accent:  req.body['colors[accent]']  || req.body.accent  || '#8a5cff',
+          bg:      req.body['colors[bg]']      || req.body.bg      || '#070811',
         },
       };
       const parsed = GenSchema.safeParse(body);
@@ -139,7 +171,7 @@ app.post(
       const logoDataURL = req.files?.logo?.[0] ? await toDataURL(req.files.logo[0]) : undefined;
       const bgDataURL   = req.files?.bg?.[0]   ? await toDataURL(req.files.bg[0])   : undefined;
 
-      // Responses API
+      // Build OpenAI request (Responses API). TANPA 'temperature' (beberapa model tidak support).
       const system = buildSystemPrompt();
       const model = process.env.MODEL || 'gpt-5';
       const maxTokens = Number(process.env.MAX_TOKENS || 4000);
@@ -160,72 +192,48 @@ app.post(
         max_output_tokens: maxTokens,
         input: [
           { role: 'system', content: [{ type: 'input_text', text: system }] },
-          { role: 'user', content: userParts },
+          { role: 'user',   content: userParts },
         ],
       });
 
-      // ---- Robust extraction ----
+      // --- Robust extraction ---
       let html = '';
       if (typeof ai?.output_text === 'string' && ai.output_text.trim()) {
         html = ai.output_text;
       } else {
-        // Cari di struktur output (berbagai varian SDK)
-        const tryBuckets = [
-          ai?.output,
-          ai?.response,
-          ai?.data,
-          Array.isArray(ai) ? ai : null,
-        ].filter(Boolean);
-
-        for (const bucket of tryBuckets) {
-          if (Array.isArray(bucket)) {
-            for (const item of bucket) {
-              const cont = item?.content || item;
+        // coba dari struktur lain
+        const buckets = [ai?.output, ai?.response, ai?.data];
+        for (const b of buckets) {
+          if (Array.isArray(b)) {
+            for (const it of b) {
+              const cont = it?.content || it;
               if (Array.isArray(cont)) {
                 const ot = cont.find(c => c?.type === 'output_text' && c?.text);
                 if (ot?.text) { html = ot.text; break; }
-                const it = cont.find(c => c?.type === 'input_text' && c?.text); // worst-case
-                if (it?.text) { html = it.text; break; }
               }
             }
           }
           if (html) break;
         }
       }
-
       html = sanitizeHTMLFromModel(html || '');
 
-      // ---- Fallback (tidak akan blank)
+      // --- Pastikan TIDAK BLANK ---
       const lower = html.trim().toLowerCase();
       const looksLikeHTML = lower.startsWith('<!doctype html') || lower.startsWith('<html');
-      if (!looksLikeHTML) {
-        html = fallbackHTML({
-          name: data.name,
-          ticker: data.ticker,
-          prompt: data.prompt,
-          colors: data.colors,
-          logoDataURL,
-          bgDataURL,
-          xurl: data.xurl,
-          tgurl: data.tgurl,
+      let finalHTML;
+      if (!html || !looksLikeHTML) {
+        // fallback page langsung (bukan wrapper) biar tetap tampil
+        finalHTML = fallbackHTML({
+          name: data.name, ticker: data.ticker, prompt: data.prompt,
+          colors: data.colors, logoDataURL, bgDataURL, xurl: data.xurl, tgurl: data.tgurl,
         });
       } else {
-        // Inject tokens & coba sematkan aset
-        html = html.replace(
-          '</head>',
-          `<style>:root{--primary:${data.colors.primary};--accent:${data.colors.accent};--bg:${data.colors.bg};}</style></head>`
-        );
-        if (logoDataURL) {
-          html = html
-            .replace('<body', '<body data-logo="embedded"')
-            .replace(/src="[^"]*logo[^"]*"/i, `src="${logoDataURL}"`);
-        }
-        if (bgDataURL) {
-          html = html.replace(/background-image:[^;]+;/i, `background-image:url("${bgDataURL}");`);
-        }
+        // Bungkus AI HTML ke penampil agar tidak pernah gelap total
+        finalHTML = wrapAIHTML({ name: data.name, ticker: data.ticker, colors: data.colors, aiHTML: html });
       }
 
-      res.json({ html });
+      res.json({ html: finalHTML, length: finalHTML.length });
     } catch (err) {
       const apiErr = err?.response?.data || err?.data || err?.message || err;
       console.error('Generation failed:', apiErr);
