@@ -11,51 +11,72 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
+app.set("trust proxy", 1); // important on Render/behind proxy
+
+// ---- ENV ----
 const PORT = process.env.PORT || 8080;
-const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
+const BASE_URL = (process.env.BASE_URL || `http://localhost:${PORT}`).replace(/\/+$/, "");
 const BODY_LIMIT = process.env.BODY_LIMIT || "15mb";
 
-// CORS
-app.use(
-  cors({
-    origin: ALLOWED_ORIGIN === "*" ? true : ALLOWED_ORIGIN
-  })
-);
+// Support comma-separated origins: "https://a.com,https://b.com"
+const ORIGIN_ENV = (process.env.ALLOWED_ORIGIN || "*").trim();
+const ALLOWED_ORIGINS =
+  ORIGIN_ENV === "*"
+    ? "*"
+    : ORIGIN_ENV
+        .split(",")
+        .map(s => s.trim())
+        .filter(Boolean);
 
-// Body parsers
+// ---- CORS ----
+const corsOptions = {
+  origin: ALLOWED_ORIGINS === "*" ? true : (origin, cb) => {
+    // allow same-origin/non-browser or listed origins
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    cb(new Error("Not allowed by CORS"));
+  },
+  credentials: false,
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
+};
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions)); // preflight
+
+// ---- Body parsers ----
 app.use(express.json({ limit: BODY_LIMIT }));
 app.use(express.urlencoded({ extended: true, limit: BODY_LIMIT }));
 
-// Folder penyimpanan hasil (ingat: disk Render ephemeral)
+// ---- Static folder for generated sites (ephemeral on Render) ----
 const SITES_DIR = path.join(__dirname, "sites");
 fs.mkdirSync(SITES_DIR, { recursive: true });
-app.use("/sites", express.static(SITES_DIR, { extensions: ["html"] }));
+app.use("/sites", express.static(SITES_DIR, {
+  extensions: ["html"],
+  setHeaders: (res) => {
+    res.setHeader("Cache-Control", "public, max-age=60");
+  }
+}));
 
-// Health
+// ---- Health ----
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-// Generate
+// ---- Generator ----
 app.post("/generate-site", async (req, res) => {
   try {
     const nano = customAlphabet("abcdefghijklmnopqrstuvwxyz0123456789", 10);
     const id = `site_${nano()}`;
     const payload = req.body || {};
 
-    // minimal guard
     if (!payload?.name && !payload?.description) {
       return res.status(400).json({ error: "Missing required fields (name or description)." });
     }
 
-    // panggil generator
     const html = await generateSiteHTML(payload);
 
-    // simpan ke folder
     const sitePath = path.join(SITES_DIR, id);
     fs.mkdirSync(sitePath, { recursive: true });
     fs.writeFileSync(path.join(sitePath, "index.html"), html, "utf8");
 
-    const url = `${BASE_URL.replace(/\/+$/, "")}/sites/${id}/`;
+    const url = `${BASE_URL}/sites/${id}/`;
     return res.json({ id, url, html, source: "ai", quality_gate: "passed" });
   } catch (err) {
     const message = err?.message || String(err);
@@ -68,11 +89,17 @@ app.post("/generate-site", async (req, res) => {
   }
 });
 
-// Root
+// ---- Root ----
 app.get("/", (_req, res) => {
-  res.type("text").send("Promptify Generator API is running. POST /generate-site");
+  res
+    .type("text")
+    .send("Promptify Generator API is running. POST /generate-site");
 });
 
+// ---- 404 fallback ----
+app.use((_req, res) => res.status(404).json({ error: "Not found" }));
+
+// ---- Start ----
 app.listen(PORT, () => {
   console.log(`API listening on ${PORT}`);
   console.log(`Health: ${BASE_URL}/health`);
