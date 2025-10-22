@@ -1,4 +1,4 @@
-// src/server.js  — FIXED
+// src/server.js — FIXED for Responses API (uses input_text/input_image)
 import 'dotenv/config';
 import express from 'express';
 import helmet from 'helmet';
@@ -13,6 +13,7 @@ import { toDataURL, sanitizeHTMLFromModel } from './util.js';
 const app = express();
 const port = process.env.PORT || 8080;
 
+// ---- CORS allowlist ----
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
   .map(s => s.trim())
@@ -41,7 +42,7 @@ const limiter = rateLimit({
 });
 app.use('/api/', limiter);
 
-// Uploads (logo/bg)
+// ---- Uploads (logo/bg) ----
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 2 * 1024 * 1024, files: 2 }, // 2MB each
@@ -49,10 +50,12 @@ const upload = multer({
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+// ---- Health ----
 app.get('/api/health', (_, res) =>
   res.json({ ok: true, service: 'promptify-backend', time: new Date().toISOString() })
 );
 
+// ---- Schema ----
 const GenSchema = z.object({
   name: z.string().min(1).max(60),
   ticker: z.string().min(1).max(16),
@@ -66,6 +69,7 @@ const GenSchema = z.object({
   }),
 });
 
+// ---- Generate ----
 app.post(
   '/api/generate',
   upload.fields([
@@ -74,6 +78,7 @@ app.post(
   ]),
   async (req, res) => {
     try {
+      // normalize body
       const body = {
         name: req.body.name,
         ticker: req.body.ticker,
@@ -86,43 +91,53 @@ app.post(
           bg: req.body['colors[bg]'] || req.body.bg || '#070811',
         },
       };
+
       const parsed = GenSchema.safeParse(body);
       if (!parsed.success) {
         return res.status(400).json({ error: 'Invalid input', details: parsed.error.flatten() });
       }
       const data = parsed.data;
 
+      // files -> data URLs
       const logoDataURL = req.files?.logo?.[0] ? await toDataURL(req.files.logo[0]) : undefined;
       const bgDataURL = req.files?.bg?.[0] ? await toDataURL(req.files.bg[0]) : undefined;
 
+      // OpenAI call (Responses API with input_text/input_image)
       const system = buildSystemPrompt();
-      const userContent = [
-        { type: 'text', text: `Project name: ${data.name}` },
-        { type: 'text', text: `Ticker: ${data.ticker}` },
-        { type: 'text', text: `Description: ${data.prompt}` },
-        { type: 'text', text: `Colors => primary: ${data.colors.primary}, accent: ${data.colors.accent}, bg: ${data.colors.bg}` },
-        { type: 'text', text: `Social => x: ${data.xurl || ''}, telegram: ${data.tgurl || ''}` },
-      ];
-      if (logoDataURL) userContent.push({ type: 'input_image', image_url: logoDataURL });
-      if (bgDataURL) userContent.push({ type: 'input_image', image_url: bgDataURL });
-
       const model = process.env.MODEL || 'gpt-5';
       const temperature = Number(process.env.TEMPERATURE || 0.4);
       const maxTokens = Number(process.env.MAX_TOKENS || 4000);
+
+      const userParts = [
+        { type: 'input_text', text: `Project name: ${data.name}` },
+        { type: 'input_text', text: `Ticker: ${data.ticker}` },
+        { type: 'input_text', text: `Description: ${data.prompt}` },
+        {
+          type: 'input_text',
+          text: `Colors => primary: ${data.colors.primary}, accent: ${data.colors.accent}, bg: ${data.colors.bg}`,
+        },
+        {
+          type: 'input_text',
+          text: `Social => x: ${data.xurl || ''}, telegram: ${data.tgurl || ''}`,
+        },
+      ];
+      if (logoDataURL) userParts.push({ type: 'input_image', image_url: logoDataURL });
+      if (bgDataURL) userParts.push({ type: 'input_image', image_url: bgDataURL });
 
       const ai = await openai.responses.create({
         model,
         temperature,
         max_output_tokens: maxTokens,
         input: [
-          { role: 'system', content: system },
-          { role: 'user', content: userContent },
+          { role: 'system', content: [{ type: 'input_text', text: system }] },
+          { role: 'user', content: userParts },
         ],
       });
 
+      // Extract final HTML
       let html = sanitizeHTMLFromModel(ai.output_text || '');
 
-      // If model didn't return a full HTML doc, wrap safely
+      // If not a full HTML doc, wrap safely so preview tetap jalan
       const lower = html.trim().toLowerCase();
       const looksLikeHTML = lower.startsWith('<!doctype html') || lower.startsWith('<html');
       if (!looksLikeHTML) {
@@ -130,7 +145,7 @@ app.post(
         html = `<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>${data.name} — ${data.ticker}</title></head><body><pre style="white-space:pre-wrap;font-family:ui-monospace,monospace">${safeBody}</pre></body></html>`;
       }
 
-      // Inject color tokens & try to apply assets if present
+      // Best-effort: inject color tokens & embed assets bila belum dipakai
       html = html.replace(
         '</head>',
         `<style>:root{--primary:${data.colors.primary};--accent:${data.colors.accent};--bg:${data.colors.bg};}</style></head>`
@@ -147,7 +162,7 @@ app.post(
 
       res.json({ html });
     } catch (err) {
-      console.error(err);
+      console.error('Generation failed:', err);
       res.status(500).json({ error: 'Generation failed', details: String(err?.message || err) });
     }
   }
