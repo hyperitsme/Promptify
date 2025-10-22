@@ -1,4 +1,4 @@
-// src/server.js — FIXED for Responses API (uses input_text/input_image)
+// src/server.js — Responses API (input_text/input_image), no temperature param
 import 'dotenv/config';
 import express from 'express';
 import helmet from 'helmet';
@@ -105,7 +105,6 @@ app.post(
       // OpenAI call (Responses API with input_text/input_image)
       const system = buildSystemPrompt();
       const model = process.env.MODEL || 'gpt-5';
-      const temperature = Number(process.env.TEMPERATURE || 0.4);
       const maxTokens = Number(process.env.MAX_TOKENS || 4000);
 
       const userParts = [
@@ -124,15 +123,17 @@ app.post(
       if (logoDataURL) userParts.push({ type: 'input_image', image_url: logoDataURL });
       if (bgDataURL) userParts.push({ type: 'input_image', image_url: bgDataURL });
 
-      const ai = await openai.responses.create({
+      // Build request WITHOUT temperature
+      const reqPayload = {
         model,
-        temperature,
         max_output_tokens: maxTokens,
         input: [
           { role: 'system', content: [{ type: 'input_text', text: system }] },
           { role: 'user', content: userParts },
         ],
-      });
+      };
+
+      const ai = await openai.responses.create(reqPayload);
 
       // Extract final HTML
       let html = sanitizeHTMLFromModel(ai.output_text || '');
@@ -162,8 +163,10 @@ app.post(
 
       res.json({ html });
     } catch (err) {
-      console.error('Generation failed:', err);
-      res.status(500).json({ error: 'Generation failed', details: String(err?.message || err) });
+      // Log detail dari SDK bila ada
+      const apiErr = err?.response?.data || err?.data || err?.message || err;
+      console.error('Generation failed:', apiErr);
+      res.status(500).json({ error: 'Generation failed', details: apiErr });
     }
   }
 );
